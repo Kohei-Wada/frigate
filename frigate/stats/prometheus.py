@@ -3,7 +3,7 @@ import re
 import time
 from typing import Any
 
-from peewee import fn
+from peewee import PeeweeException, fn
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import (
     REGISTRY,
@@ -31,13 +31,22 @@ class CustomCollector:
         """Event counts per camera and label, re-queried at most once per TTL."""
         now = time.time()
 
-        if now - self.event_counts_updated >= EVENT_COUNT_TTL:
+        if now - self.event_counts_updated < EVENT_COUNT_TTL:
+            return self.event_counts
+
+        try:
             self.event_counts = list(
                 Event.select(Event.camera, Event.label, fn.Count())
                 .group_by(Event.camera, Event.label)
                 .dicts()
             )
-            self.event_counts_updated = now
+        except PeeweeException as e:
+            # registering this collector collects it once, before the models
+            # are bound to a database
+            logging.debug(f"Could not read event counts: {e}")
+            return self.event_counts
+
+        self.event_counts_updated = now
 
         return self.event_counts
 
