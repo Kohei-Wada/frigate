@@ -1,7 +1,9 @@
 import logging
 import re
+import time
 from typing import Any
 
+from peewee import fn
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import (
     REGISTRY,
@@ -10,6 +12,11 @@ from prometheus_client.core import (
     InfoMetricFamily,
 )
 
+from frigate.models import Event
+
+# the event count query scans the events table, so a scrape reuses this result
+EVENT_COUNT_TTL = 60
+
 
 class CustomCollector:
     def __init__(self, _url):
@@ -17,7 +24,22 @@ class CustomCollector:
         self.process_stats = {}  # Keep for CPU processing
         self.previous_event_id = None
         self.previous_event_start_time = None
-        self.all_events = {}
+        self.event_counts: list[dict[str, Any]] = []
+        self.event_counts_updated = 0.0
+
+    def get_event_counts(self) -> list[dict[str, Any]]:
+        """Event counts per camera and label, re-queried at most once per TTL."""
+        now = time.time()
+
+        if now - self.event_counts_updated >= EVENT_COUNT_TTL:
+            self.event_counts = list(
+                Event.select(Event.camera, Event.label, fn.Count())
+                .group_by(Event.camera, Event.label)
+                .dicts()
+            )
+            self.event_counts_updated = now
+
+        return self.event_counts
 
     def add_metric(self, metric, label, stats, key, multiplier=1.0):  # Now a method
         try:
@@ -478,11 +500,10 @@ class CustomCollector:
             labels=["camera", "label"],
         )
 
-        if len(self.all_events) > 0:
-            for event_count in self.all_events:
-                camera_events.add_metric(
-                    [event_count["camera"], event_count["label"]], event_count["Count"]
-                )
+        for event_count in self.get_event_counts():
+            camera_events.add_metric(
+                [event_count["camera"], event_count["label"]], event_count["Count"]
+            )
 
         yield camera_events
 
@@ -491,7 +512,7 @@ collector = CustomCollector(None)
 REGISTRY.register(collector)
 
 
-def update_metrics(stats: dict[str, Any], event_counts: list[dict[str, Any]]):
+def update_metrics(stats: dict[str, Any]):
     """Updates the Prometheus metrics with the given stats data."""
     try:
         # Store the complete stats for later use by collect()
@@ -499,8 +520,6 @@ def update_metrics(stats: dict[str, Any], event_counts: list[dict[str, Any]]):
 
         # For backwards compatibility
         collector.process_stats = stats.copy()
-
-        collector.all_events = event_counts
 
         # No need to call collect() here - it will be called by get_metrics()
     except Exception as e:
